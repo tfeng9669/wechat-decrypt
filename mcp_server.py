@@ -371,6 +371,19 @@ def _is_safe_msg_table_name(table_name):
     return bool(re.fullmatch(r'Msg_[0-9a-f]{32}', table_name))
 
 
+def _load_name2id_maps(conn):
+    """从消息 DB 的 Name2Id 表加载 rowid → username 映射。"""
+    id_to_username = {}
+    try:
+        rows = conn.execute("SELECT rowid, user_name FROM Name2Id").fetchall()
+    except sqlite3.Error:
+        return id_to_username
+    for rowid, user_name in rows:
+        if user_name:
+            id_to_username[rowid] = user_name
+    return id_to_username
+
+
 def _normalize_speaker_filter(speaker):
     aliases = {
         'all': 'all',
@@ -554,6 +567,9 @@ def _load_chat_messages(username, display_name, limit, since_ts=0, until_ts=0):
 
     conn = sqlite3.connect(db_path)
     try:
+        # 加载 Name2Id 映射，用于通过 real_sender_id 精确解析群聊发言人
+        id_to_username = _load_name2id_maps(conn)
+
         if since_ts > 0 and until_ts > 0:
             rows = conn.execute(f"""
                 SELECT local_id, local_type, create_time, message_content,
@@ -640,8 +656,18 @@ def _load_chat_messages(username, display_name, limit, since_ts=0, until_ts=0):
             text = text[:500] + "..."
 
         if is_group:
-            speaker_kind = 'other' if sender else 'system'
-            speaker_label = names.get(sender, sender) if sender else "系统"
+            # 优先用 real_sender_id 通过 Name2Id 表精确解析发言人
+            sender_username = id_to_username.get(real_sender_id, '')
+            if sender_username and sender_username != username:
+                speaker_kind = 'other'
+                speaker_label = names.get(sender_username, sender_username)
+            elif sender:
+                # 回退到 content 前缀解析
+                speaker_kind = 'other'
+                speaker_label = names.get(sender, sender)
+            else:
+                speaker_kind = 'system'
+                speaker_label = "系统"
         else:
             speaker_kind, speaker_label = _classify_private_speaker(
                 status, local_type, display_name,
