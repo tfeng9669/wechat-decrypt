@@ -219,6 +219,9 @@ atexit.register(_cache.cleanup)
 
 _contact_names = None  # {username: display_name}
 _contact_full = None   # [{username, nick_name, remark}]
+_self_username = None
+_XML_UNSAFE_RE = re.compile(r'<!DOCTYPE|<!ENTITY', re.IGNORECASE)
+_XML_PARSE_MAX_LEN = 20000
 
 
 def _load_contacts_from(db_path):
@@ -272,11 +275,12 @@ def get_contact_full():
 # ============ 辅助函数 ============
 
 def format_msg_type(t):
+    base_type = t % 4294967296 if t > 4294967296 else t
     return {
         1: '文本', 3: '图片', 34: '语音', 42: '名片',
         43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
         50: '通话', 10000: '系统', 10002: '撤回',
-    }.get(t, f'type={t}')
+    }.get(base_type, f'type={t}')
 
 
 def resolve_username(chat_name):
@@ -330,6 +334,41 @@ def _parse_message_content(content, local_type, is_group):
         sender, text = content.split(':\n', 1)
 
     return sender, text
+
+
+def _parse_xml_safe(content):
+    """安全解析 XML，防止 XXE 注入和超长内容。"""
+    if not content or len(content) > _XML_PARSE_MAX_LEN or _XML_UNSAFE_RE.search(content):
+        return None
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError:
+        return None
+
+
+def _get_self_username():
+    """自动识别当前用户的 username（从 DB_DIR 路径推断）。"""
+    global _self_username
+    if _self_username:
+        return _self_username
+    if not DB_DIR:
+        return ''
+    names = get_contact_names()
+    account_dir = os.path.basename(os.path.dirname(DB_DIR))
+    candidates = [account_dir]
+    m = re.fullmatch(r'(.+)_([0-9a-fA-F]{4,})', account_dir)
+    if m:
+        candidates.insert(0, m.group(1))
+    for candidate in candidates:
+        if candidate and candidate in names:
+            _self_username = candidate
+            return _self_username
+    return ''
+
+
+def _is_safe_msg_table_name(table_name):
+    """校验消息表名格式，防止 SQL 注入。"""
+    return bool(re.fullmatch(r'Msg_[0-9a-f]{32}', table_name))
 
 
 def _normalize_speaker_filter(speaker):
@@ -445,9 +484,8 @@ def _detect_my_sender_id(db_path, table_name):
 
 def _format_appmsg(xml_text):
     """解析 appmsg XML，根据子类型返回可读文本。"""
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
+    root = _parse_xml_safe(xml_text)
+    if root is None:
         return "[链接/文件]"
 
     title = root.findtext('.//title') or ""
@@ -457,22 +495,31 @@ def _format_appmsg(xml_text):
     if appmsg_type == '57':
         refer = root.find('.//refermsg')
         if refer is not None:
-            ref_name = refer.findtext('displayname') or ""
+            # 优先用 fromusr 精确解析被引用人
+            ref_user = (refer.findtext('fromusr') or '').strip()
+            ref_display = refer.findtext('displayname') or ""
+            if ref_user:
+                names = get_contact_names()
+                self_user = _get_self_username()
+                if self_user and ref_user == self_user:
+                    ref_name = "我"
+                else:
+                    ref_name = names.get(ref_user, ref_display or ref_user)
+            else:
+                ref_name = ref_display
             ref_content = refer.findtext('content') or ""
             # 被引用内容本身可能是 XML（如 appmsg），提取纯文本
             if ref_content.lstrip().startswith('<'):
-                try:
-                    ref_root = ET.fromstring(ref_content)
+                ref_root = _parse_xml_safe(ref_content)
+                if ref_root is not None:
                     ref_content = ref_root.findtext('.//title') or ref_content
-                except Exception:
-                    pass
             if len(ref_content) > 50:
                 ref_content = ref_content[:50] + "..."
             return f"[引用 {ref_name}: \"{ref_content}\"] {title}"
         return title or "[引用回复]"
 
-    # type=33/36: 小程序
-    if appmsg_type in ('33', '36'):
+    # type=33/36/44: 小程序
+    if appmsg_type in ('33', '36', '44'):
         return f"[小程序] {title}" if title else "[小程序]"
 
     # type=19: 合并转发的聊天记录
@@ -486,9 +533,7 @@ def _format_appmsg(xml_text):
     if appmsg_type == '6':
         return f"[文件] {title}" if title else "[文件]"
 
-    # type=5: 链接文章
-    # type=4: 音乐
-    # 其他: 默认提取标题和URL
+    # type=5: 链接文章 / 其他: 默认提取标题和URL
     url = root.findtext('.//url') or ""
     if title:
         return f"[链接] {title}" + (f" ({url})" if url else "")
@@ -556,27 +601,34 @@ def _load_chat_messages(username, display_name, limit, since_ts=0, until_ts=0):
         elif base_type == 34:
             # 语音：从 XML 提取时长
             dur_str = ""
-            try:
-                root = ET.fromstring(text or content)
+            root = _parse_xml_safe(text or content)
+            if root is not None:
                 voice = root.find('.//voicemsg')
                 if voice is not None:
                     ms = int(voice.get('voicelength') or 0)
                     dur_str = f" {round(ms / 1000, 1)}s"
-            except Exception:
-                pass
             text = f"[语音{dur_str}] (local_id={local_id})"
         elif base_type == 49:
             text = _format_appmsg(text or content)
         elif base_type == 50:
             # 通话：从 CDATA msg 提取描述
+            _voip_status_map = {
+                'Canceled': '已取消', 'Line busy': '对方忙线',
+                'Already answered elsewhere': '已在其他设备接听',
+                'Declined on other device': '已在其他设备拒接',
+                'Call canceled by caller': '主叫已取消',
+                'Call not answered': '未接听', "Call wasn't answered": '未接听',
+            }
             desc = ""
-            try:
-                root = ET.fromstring(text or content)
-                desc = (root.findtext('.//msg') or "").strip()
-                if desc.startswith("通话时长"):
-                    desc = desc.replace("通话时长", "").strip()
-            except Exception:
-                pass
+            root = _parse_xml_safe(text or content)
+            if root is not None:
+                raw = (root.findtext('.//msg') or "").strip()
+                if raw.startswith("通话时长"):
+                    desc = raw.replace("通话时长", "").strip()
+                elif raw.startswith("Duration:"):
+                    desc = "通话时长 " + raw.split(":", 1)[1].strip()
+                elif raw:
+                    desc = _voip_status_map.get(raw, raw)
             text = f"[通话 {desc}]" if desc else "[通话]"
         elif base_type == 47:
             text = "[表情]"
@@ -627,6 +679,8 @@ def _find_msg_table_for_user(username):
     """在所有 message_N.db 中查找用户的消息表，返回 (db_path, table_name)"""
     table_hash = hashlib.md5(username.encode()).hexdigest()
     table_name = f"Msg_{table_hash}"
+    if not _is_safe_msg_table_name(table_name):
+        return None, None
 
     for rel_key in MSG_DB_KEYS:
         path = _cache.get(rel_key)
