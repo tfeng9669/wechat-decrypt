@@ -99,18 +99,20 @@ Linux 版 `config.json` 示例：
 - 总延迟约 100ms
 - **图片消息内联预览**（支持旧 XOR / V1 / V2 三种 .dat 加密格式）
 
-### MCP Server (Claude AI 集成)
+### MCP Server (AI 集成)
 
-将微信数据查询能力接入 [Claude Code](https://claude.ai/claude-code)，让 AI 直接读取你的微信消息。
+将微信数据查询能力接入 AI 工具（Claude Code、OpenClaw 等），让 AI 直接读取你的微信消息、语音转写、群聊统计。
+
+#### 安装依赖
 
 ```bash
-pip install mcp
+pip install -r requirements.txt
 ```
 
-注册到 Claude Code：
+#### 注册到 Claude Code
 
 ```bash
-claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_server.py
+claude mcp add wechat -- python /path/to/wechat-decrypt/mcp_server.py
 ```
 
 或手动编辑 `~/.claude.json`：
@@ -121,23 +123,64 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
     "wechat": {
       "type": "stdio",
       "command": "python",
-      "args": ["C:\\Users\\你的用户名\\wechat-decrypt\\mcp_server.py"]
+      "args": ["/path/to/wechat-decrypt/mcp_server.py"]
     }
   }
 }
 ```
 
-注册后在 Claude Code 中即可使用以下工具：
+#### 可用工具
 
 | Tool | 功能 |
 |------|------|
 | `get_recent_sessions(limit)` | 最近会话列表（含消息摘要、未读数） |
-| `get_chat_history(chat_name, limit)` | 指定聊天的消息记录（支持模糊匹配名字） |
-| `search_messages(keyword, limit)` | 全库搜索消息内容 |
+| `get_chat_history(chat_name, limit, speaker, days, date)` | 聊天记录，支持发言人过滤、按天/按日期查询 |
+| `search_messages(keyword, limit, days, date)` | 全库搜索，支持时间范围限定 |
 | `get_contacts(query, limit)` | 搜索/列出联系人 |
 | `get_new_messages()` | 获取自上次调用以来的新消息 |
+| `get_chat_images(chat_name, limit)` | 列出聊天中的图片消息 |
+| `decode_image(chat_name, local_id)` | 解密查看指定图片 |
+| `transcribe_voice(chat_name, local_id, limit)` | 语音转文字（本地 faster-whisper，无 API 费用） |
+| `get_group_stats(chat_name, days, date)` | 群聊发言排行统计 |
 
-前置条件：需要先运行 `python main.py` 或 `python find_all_keys.py` 完成密钥提取。
+#### 参数说明
+
+- **speaker**: `all`（默认）/ `me` / `other` — 过滤发言人，做人物画像建议用 `other`
+- **days**: `1`=今天，`3`=最近3天，`7`=最近一周
+- **date**: 指定具体日期，格式 `YYYY-MM-DD`（如 `2026-03-05`）
+
+#### 消息格式化
+
+聊天记录中各类消息自动格式化为可读文本：
+
+| 消息类型 | 显示效果 |
+|---------|---------|
+| 语音 | `[语音 3.3s] (local_id=27758)` |
+| 通话 | `[通话 00:56]` / `[通话 已取消]` |
+| 链接 | `[链接] 文章标题 (url)` |
+| 引用回复 | `[引用 张三: "原消息"] 回复内容` |
+| 图片 | `[图片] (local_id=460)` |
+| 文件 | `[文件] 文件名.pdf` |
+| 聊天记录转发 | `[聊天记录] 群聊的聊天记录: 摘要...` |
+| 小程序 | `[小程序] 标题` |
+
+#### 语音转写
+
+基于 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 本地运行，无需外部 API，零费用：
+
+```
+# 单条转写
+transcribe_voice(chat_name="张三", local_id=27759)
+
+# 批量转写最近 5 条语音
+transcribe_voice(chat_name="张三", limit=5)
+```
+
+转写结果自动标注发言人（私聊：我/对方，群聊：具体成员昵称）。
+
+#### 前置条件
+
+需要先运行 `python main.py` 或 `python find_all_keys.py` 完成密钥提取。
 
 **[查看使用案例 →](USAGE.md)**
 

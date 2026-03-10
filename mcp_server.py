@@ -6,6 +6,7 @@ Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
 import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re
+import xml.etree.ElementTree as ET
 import hmac as hmac_mod
 from datetime import datetime
 from Crypto.Cipher import AES
@@ -331,6 +332,288 @@ def _parse_message_content(content, local_type, is_group):
     return sender, text
 
 
+def _normalize_speaker_filter(speaker):
+    aliases = {
+        'all': 'all',
+        'both': 'all',
+        '全部': 'all',
+        'me': 'me',
+        'self': 'me',
+        '我': 'me',
+        'other': 'other',
+        'them': 'other',
+        'contact': 'other',
+        '对方': 'other',
+    }
+    key = (speaker or 'all').strip().lower()
+    return aliases.get(key)
+
+
+def _classify_private_speaker(status, local_type, display_name, real_sender_id=None, my_sender_id=None):
+    """私聊消息归类为我 / 对方 / 系统，避免下游分析混淆发言人。
+
+    优先使用 real_sender_id（可靠），status 仅作为回退。
+    macOS 微信数据库中 status 字段在部分消息上不准确（如同步后全部变为 3），
+    而 real_sender_id 始终能正确区分发送方。
+    """
+    if local_type in (10000, 10002) or status == 4:
+        return 'system', '系统'
+    # 优先用 real_sender_id 判断
+    if real_sender_id is not None and my_sender_id is not None:
+        if real_sender_id == my_sender_id:
+            return 'me', '我'
+        return 'other', display_name
+    # 回退到 status（不完全可靠）
+    if status in (2, 5):
+        return 'me', '我'
+    return 'other', display_name
+
+
+_my_sender_id_cache = {}  # db_path -> my_sender_id
+
+
+def _detect_my_sender_id(db_path, table_name):
+    """推断当前用户在该 DB 中的 real_sender_id。
+
+    优先从当前表的 status=2 消息推断；若无 status=2，
+    则扫描同一 DB 的所有消息表，取跨表出现次数最多的 real_sender_id。
+    结果按 db_path 缓存。
+    """
+    if db_path in _my_sender_id_cache:
+        return _my_sender_id_cache[db_path]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        # 方法1：当前表的 status=2
+        rows = conn.execute(f"""
+            SELECT DISTINCT real_sender_id FROM [{table_name}]
+            WHERE status = 2 AND real_sender_id IS NOT NULL
+            LIMIT 5
+        """).fetchall()
+        if rows and len(set(r[0] for r in rows)) == 1:
+            _my_sender_id_cache[db_path] = rows[0][0]
+            return rows[0][0]
+
+        # 方法2：扫描同 DB 所有表，跨表出现最多的 status=2 sender
+        all_tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+        ).fetchall()]
+        from collections import Counter
+        status2_counter = Counter()
+        for t in all_tables:
+            try:
+                for r in conn.execute(f"""
+                    SELECT DISTINCT real_sender_id FROM [{t}]
+                    WHERE status = 2 AND real_sender_id IS NOT NULL
+                """).fetchall():
+                    status2_counter[r[0]] += 1
+            except Exception:
+                pass
+        if status2_counter:
+            winner = status2_counter.most_common(1)[0][0]
+            _my_sender_id_cache[db_path] = winner
+            return winner
+
+        # 方法3：无 status=2 消息，取跨表出现频率最高的 real_sender_id
+        freq_counter = Counter()
+        for t in all_tables:
+            try:
+                seen = set()
+                for r in conn.execute(f"""
+                    SELECT DISTINCT real_sender_id FROM [{t}]
+                    WHERE real_sender_id IS NOT NULL
+                """).fetchall():
+                    seen.add(r[0])
+                for sid in seen:
+                    freq_counter[sid] += 1
+            except Exception:
+                pass
+        if freq_counter:
+            winner = freq_counter.most_common(1)[0][0]
+            # 只有在明显领先时才信任（出现在 >30% 的表中）
+            if freq_counter[winner] > len(all_tables) * 0.3:
+                _my_sender_id_cache[db_path] = winner
+                return winner
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+    _my_sender_id_cache[db_path] = None
+    return None
+
+
+def _format_appmsg(xml_text):
+    """解析 appmsg XML，根据子类型返回可读文本。"""
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return "[链接/文件]"
+
+    title = root.findtext('.//title') or ""
+    appmsg_type = root.findtext('.//type') or ""
+
+    # type=57: 引用回复
+    if appmsg_type == '57':
+        refer = root.find('.//refermsg')
+        if refer is not None:
+            ref_name = refer.findtext('displayname') or ""
+            ref_content = refer.findtext('content') or ""
+            # 被引用内容本身可能是 XML（如 appmsg），提取纯文本
+            if ref_content.lstrip().startswith('<'):
+                try:
+                    ref_root = ET.fromstring(ref_content)
+                    ref_content = ref_root.findtext('.//title') or ref_content
+                except Exception:
+                    pass
+            if len(ref_content) > 50:
+                ref_content = ref_content[:50] + "..."
+            return f"[引用 {ref_name}: \"{ref_content}\"] {title}"
+        return title or "[引用回复]"
+
+    # type=33/36: 小程序
+    if appmsg_type in ('33', '36'):
+        return f"[小程序] {title}" if title else "[小程序]"
+
+    # type=19: 合并转发的聊天记录
+    if appmsg_type == '19':
+        des = root.findtext('.//des') or ""
+        if len(des) > 100:
+            des = des[:100] + "..."
+        return f"[聊天记录] {title}: {des}" if des else f"[聊天记录] {title}"
+
+    # type=6: 文件
+    if appmsg_type == '6':
+        return f"[文件] {title}" if title else "[文件]"
+
+    # type=5: 链接文章
+    # type=4: 音乐
+    # 其他: 默认提取标题和URL
+    url = root.findtext('.//url') or ""
+    if title:
+        return f"[链接] {title}" + (f" ({url})" if url else "")
+    return "[链接/文件]"
+
+
+def _load_chat_messages(username, display_name, limit, since_ts=0, until_ts=0):
+    """读取并解析聊天消息，按时间正序返回。since_ts/until_ts 用于时间范围过滤。"""
+    is_group = '@chatroom' in username
+    db_path, table_name = _find_msg_table_for_user(username)
+    if not db_path:
+        return None, f"找不到 {display_name} 的消息记录（可能在未解密的DB中或无消息）"
+
+    # 私聊时，先检测当前用户的 real_sender_id
+    my_sender_id = None
+    if not is_group:
+        my_sender_id = _detect_my_sender_id(db_path, table_name)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        if since_ts > 0 and until_ts > 0:
+            rows = conn.execute(f"""
+                SELECT local_id, local_type, create_time, message_content,
+                       WCDB_CT_message_content, status, real_sender_id
+                FROM [{table_name}]
+                WHERE create_time >= ? AND create_time < ?
+                ORDER BY create_time DESC
+                LIMIT ?
+            """, (since_ts, until_ts, limit)).fetchall()
+        elif since_ts > 0:
+            rows = conn.execute(f"""
+                SELECT local_id, local_type, create_time, message_content,
+                       WCDB_CT_message_content, status, real_sender_id
+                FROM [{table_name}]
+                WHERE create_time >= ?
+                ORDER BY create_time DESC
+                LIMIT ?
+            """, (since_ts, limit)).fetchall()
+        else:
+            rows = conn.execute(f"""
+                SELECT local_id, local_type, create_time, message_content,
+                       WCDB_CT_message_content, status, real_sender_id
+                FROM [{table_name}]
+                ORDER BY create_time DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+    except Exception as e:
+        conn.close()
+        return None, f"查询失败: {e}"
+    conn.close()
+
+    names = get_contact_names()
+    messages = []
+    for local_id, local_type, create_time, content, ct, status, real_sender_id in reversed(rows):
+        content = _decompress_content(content, ct)
+        if content is None:
+            content = '(无法解压)'
+
+        # 新版微信用高位编码消息类型，取低32位还原基础类型
+        base_type = local_type % 4294967296 if local_type > 4294967296 else local_type
+
+        sender, text = _parse_message_content(content, base_type, is_group)
+        if base_type == 3:
+            text = f"[图片] (local_id={local_id})"
+        elif base_type == 34:
+            # 语音：从 XML 提取时长
+            dur_str = ""
+            try:
+                root = ET.fromstring(text or content)
+                voice = root.find('.//voicemsg')
+                if voice is not None:
+                    ms = int(voice.get('voicelength') or 0)
+                    dur_str = f" {round(ms / 1000, 1)}s"
+            except Exception:
+                pass
+            text = f"[语音{dur_str}] (local_id={local_id})"
+        elif base_type == 49:
+            text = _format_appmsg(text or content)
+        elif base_type == 50:
+            # 通话：从 CDATA msg 提取描述
+            desc = ""
+            try:
+                root = ET.fromstring(text or content)
+                desc = (root.findtext('.//msg') or "").strip()
+                if desc.startswith("通话时长"):
+                    desc = desc.replace("通话时长", "").strip()
+            except Exception:
+                pass
+            text = f"[通话 {desc}]" if desc else "[通话]"
+        elif base_type == 47:
+            text = "[表情]"
+        elif base_type != 1:
+            type_label = format_msg_type(base_type)
+            text = f"[{type_label}] {text}" if text else f"[{type_label}]"
+
+        if text and len(text) > 500:
+            text = text[:500] + "..."
+
+        if is_group:
+            speaker_kind = 'other' if sender else 'system'
+            speaker_label = names.get(sender, sender) if sender else "系统"
+        else:
+            speaker_kind, speaker_label = _classify_private_speaker(
+                status, local_type, display_name,
+                real_sender_id=real_sender_id, my_sender_id=my_sender_id,
+            )
+
+        messages.append({
+            'local_id': local_id,
+            'local_type': local_type,
+            'create_time': create_time,
+            'status': status,
+            'speaker_kind': speaker_kind,
+            'speaker_label': speaker_label,
+            'text': text,
+        })
+
+    return messages, None
+
+
+def _format_message_line(msg):
+    time_str = datetime.fromtimestamp(msg['create_time']).strftime('%m-%d %H:%M')
+    return f"[{time_str}] {msg['speaker_label']}: {msg['text']}"
+
+
 # 消息 DB 的 rel_keys
 # 用 message_\d+\.db$ 匹配，自然排除 message_resource.db / message_fts_*.db
 MSG_DB_KEYS = sorted([
@@ -434,86 +717,98 @@ def get_recent_sessions(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def get_chat_history(chat_name: str, limit: int = 50) -> str:
+def get_chat_history(chat_name: str, limit: int = 50, speaker: str = "all", days: int = 0, date: str = "") -> str:
     """获取指定聊天的消息记录。
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid，自动模糊匹配
         limit: 返回的消息数量，默认50
+        speaker: 发言人过滤，支持 all / me / other。做人画像建议用 other
+        days: 只返回最近N天的消息（0=不限，1=今天，3=最近3天）
+        date: 指定具体日期，格式 YYYY-MM-DD（如 2026-03-05），查该天的消息
     """
     username = resolve_username(chat_name)
     if not username:
         return f"找不到聊天对象: {chat_name}\n提示: 可以用 get_contacts(query='{chat_name}') 搜索联系人"
 
+    speaker_filter = _normalize_speaker_filter(speaker)
+    if not speaker_filter:
+        return "speaker 参数无效，支持: all / me / other"
+
     names = get_contact_names()
     display_name = names.get(username, username)
     is_group = '@chatroom' in username
 
-    db_path, table_name = _find_msg_table_for_user(username)
-    if not db_path:
-        return f"找不到 {display_name} 的消息记录（可能在未解密的DB中或无消息）"
+    if is_group and speaker_filter != 'all':
+        return "群聊暂不支持 speaker 过滤，请使用 speaker='all'"
 
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(f"""
-            SELECT local_id, local_type, create_time, message_content,
-                   WCDB_CT_message_content
-            FROM [{table_name}]
-            ORDER BY create_time DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-    except Exception as e:
-        conn.close()
-        return f"查询失败: {e}"
-    conn.close()
+    since_ts = 0
+    until_ts = 0
+    if date:
+        try:
+            day_start = datetime.strptime(date, "%Y-%m-%d")
+            from datetime import timedelta
+            since_ts = int(day_start.timestamp())
+            until_ts = int((day_start + timedelta(days=1)).timestamp())
+            limit = max(limit, 500)
+        except ValueError:
+            return "date 格式无效，请用 YYYY-MM-DD（如 2026-03-05）"
+    elif days and days > 0:
+        from datetime import timedelta
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        since_ts = int((today_start - timedelta(days=days - 1)).timestamp())
+        limit = max(limit, 500)
 
-    if not rows:
+    messages, error = _load_chat_messages(username, display_name, limit, since_ts=since_ts, until_ts=until_ts)
+    if error:
+        return error
+    if not messages:
         return f"{display_name} 无消息记录"
 
     lines = []
-    for local_id, local_type, create_time, content, ct in reversed(rows):
-        time_str = datetime.fromtimestamp(create_time).strftime('%m-%d %H:%M')
+    for msg in messages:
+        if speaker_filter != 'all' and msg['speaker_kind'] != speaker_filter:
+            continue
+        lines.append(_format_message_line(msg))
 
-        # zstd 解压
-        content = _decompress_content(content, ct)
-        if content is None:
-            content = '(无法解压)'
-
-        sender, text = _parse_message_content(content, local_type, is_group)
-
-        if local_type == 3:
-            text = f"[图片] (local_id={local_id})"
-        elif local_type == 47:
-            text = "[表情]"
-        elif local_type != 1:
-            type_label = format_msg_type(local_type)
-            text = f"[{type_label}] {text}" if text else f"[{type_label}]"
-
-        if text and len(text) > 500:
-            text = text[:500] + "..."
-
-        if is_group and sender:
-            sender_name = names.get(sender, sender)
-            lines.append(f"[{time_str}] {sender_name}: {text}")
-        else:
-            lines.append(f"[{time_str}] {text}")
+    if not lines:
+        return f"{display_name} 无符合条件的消息记录 (speaker={speaker_filter})"
 
     header = f"{display_name} 的最近 {len(lines)} 条消息"
     if is_group:
         header += " [群聊]"
+    elif speaker_filter != 'all':
+        header += f" [speaker={speaker_filter}]"
     return header + ":\n\n" + "\n".join(lines)
 
 
 @mcp.tool()
-def search_messages(keyword: str, limit: int = 20) -> str:
+def search_messages(keyword: str, limit: int = 20, days: int = 0, date: str = "") -> str:
     """在所有聊天记录中搜索包含关键词的消息。
 
     Args:
         keyword: 搜索关键词
         limit: 返回的结果数量，默认20
+        days: 只搜索最近N天（0=不限，1=今天，7=最近一周）
+        date: 指定具体日期，格式 YYYY-MM-DD
     """
     if not keyword or len(keyword) < 1:
         return "请提供搜索关键词"
+
+    # 时间范围
+    since_ts, until_ts = 0, 0
+    if date:
+        try:
+            from datetime import timedelta
+            day_start = datetime.strptime(date, "%Y-%m-%d")
+            since_ts = int(day_start.timestamp())
+            until_ts = int((day_start + timedelta(days=1)).timestamp())
+        except ValueError:
+            return "date 格式无效，请用 YYYY-MM-DD"
+    elif days and days > 0:
+        from datetime import timedelta
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        since_ts = int((today_start - timedelta(days=days - 1)).timestamp())
 
     names = get_contact_names()
     results = []
@@ -550,14 +845,24 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                 display = names.get(username, username) if username else tname
 
                 try:
+                    time_clause = ""
+                    params = [f'%{keyword}%']
+                    if since_ts > 0 and until_ts > 0:
+                        time_clause = " AND create_time >= ? AND create_time < ?"
+                        params.extend([since_ts, until_ts])
+                    elif since_ts > 0:
+                        time_clause = " AND create_time >= ?"
+                        params.append(since_ts)
+                    params.append(limit - len(results))
+
                     rows = conn.execute(f"""
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content
                         FROM [{tname}]
-                        WHERE message_content LIKE ?
+                        WHERE message_content LIKE ?{time_clause}
                         ORDER BY create_time DESC
                         LIMIT ?
-                    """, (f'%{keyword}%', limit - len(results))).fetchall()
+                    """, params).fetchall()
                 except Exception:
                     continue
 
@@ -801,6 +1106,245 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
         lines.append(line)
 
     return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines)
+
+
+# ============ 语音转写 ============
+
+_whisper_model = None
+_media_db_cache = {}  # db_path -> (mtime, tmp_path)
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def _get_media_db_conn():
+    """解密并缓存 media_0.db，返回 sqlite3 连接。"""
+    media_rel = "message/media_0.db"
+    db_path = os.path.join(DB_DIR, media_rel)
+    if not os.path.exists(db_path):
+        return None
+
+    mtime = os.path.getmtime(db_path)
+    wal_path = db_path + "-wal"
+    wal_mtime = os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0
+
+    cached = _media_db_cache.get(db_path)
+    if cached and cached[0] == (mtime, wal_mtime):
+        return sqlite3.connect(cached[1])
+
+    keys_file = _cfg["keys_file"]
+    with open(keys_file) as f:
+        keys = json.load(f)
+    key_entry = keys.get(media_rel)
+    if not key_entry:
+        return None
+    enc_key = bytes.fromhex(key_entry["enc_key"])
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "wechat_mcp_cache", "media_0.db")
+    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+    full_decrypt(db_path, tmp_path, enc_key)
+    if os.path.exists(wal_path):
+        decrypt_wal(wal_path, tmp_path, enc_key)
+
+    _media_db_cache[db_path] = ((mtime, wal_mtime), tmp_path)
+    return sqlite3.connect(tmp_path)
+
+
+def _silk_to_text(voice_data):
+    """SILK voice data -> transcribed text."""
+    import pilk
+    import wave
+
+    silk_path = tempfile.mktemp(suffix=".silk")
+    pcm_path = tempfile.mktemp(suffix=".pcm")
+    wav_path = tempfile.mktemp(suffix=".wav")
+    try:
+        # Strip WeChat SILK header byte (0x02)
+        with open(silk_path, "wb") as f:
+            f.write(voice_data[1:] if voice_data[0:1] == b"\x02" else voice_data)
+
+        pilk.decode(silk_path, pcm_path)
+
+        # PCM -> WAV (16-bit, 24000 Hz mono)
+        with open(pcm_path, "rb") as f:
+            pcm_data = f.read()
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(pcm_data)
+
+        model = _get_whisper_model()
+        segments, _ = model.transcribe(wav_path, language="zh")
+        return "".join(s.text for s in segments).strip()
+    finally:
+        for p in (silk_path, pcm_path, wav_path):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+@mcp.tool()
+def transcribe_voice(chat_name: str, local_id: int = 0, limit: int = 0) -> str:
+    """转写微信语音消息为文字。
+
+    两种用法：
+    1. 指定 local_id：转写单条语音
+    2. 指定 limit（不指定 local_id）：转写该聊天最近 N 条语音
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 语音消息的 local_id（从 get_chat_history 获取），0 表示不指定
+        limit: 批量转写最近 N 条语音（默认 0，即不批量；建议不超过 10）
+    """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    names = get_contact_names()
+    display_name = names.get(username, username)
+
+    conn = _get_media_db_conn()
+    if not conn:
+        return "无法打开语音数据库 (media_0.db)"
+
+    try:
+        # 找到 chat_name_id
+        row = conn.execute(
+            "SELECT rowid FROM Name2Id WHERE user_name = ?", (username,)
+        ).fetchone()
+        if not row:
+            return f"{display_name} 无语音记录"
+        chat_name_id = row[0]
+
+        if local_id:
+            # 单条转写
+            row = conn.execute(
+                "SELECT voice_data FROM VoiceInfo WHERE chat_name_id = ? AND local_id = ?",
+                (chat_name_id, local_id),
+            ).fetchone()
+            if not row or not row[0]:
+                return f"找不到 local_id={local_id} 的语音数据"
+            text = _silk_to_text(row[0])
+            return f"[语音转写] {text}" if text else "[语音转写] (无法识别)"
+
+        elif limit and limit > 0:
+            # 批量转写
+            limit = min(limit, 20)
+            rows = conn.execute(
+                """SELECT local_id, create_time, voice_data FROM VoiceInfo
+                   WHERE chat_name_id = ?
+                   ORDER BY create_time DESC LIMIT ?""",
+                (chat_name_id, limit),
+            ).fetchall()
+            if not rows:
+                return f"{display_name} 无语音记录"
+
+            # 获取发言人信息
+            is_group = '@chatroom' in username
+            msg_db_path, msg_table = _find_msg_table_for_user(username)
+            my_sender_id = None
+            if msg_db_path and not is_group:
+                my_sender_id = _detect_my_sender_id(msg_db_path, msg_table)
+
+            results = []
+            for lid, ctime, vdata in reversed(rows):
+                ts = datetime.fromtimestamp(ctime).strftime("%m-%d %H:%M")
+                # 判断发言人
+                speaker = display_name
+                if msg_db_path:
+                    msg_conn = sqlite3.connect(msg_db_path)
+                    try:
+                        msg_row = msg_conn.execute(
+                            f"SELECT message_content, WCDB_CT_message_content, real_sender_id FROM [{msg_table}] WHERE local_id = ?",
+                            (lid,),
+                        ).fetchone()
+                        if msg_row:
+                            if is_group:
+                                # 群聊：从 "wxid:\n" 前缀提取发言人
+                                mc = _decompress_content(msg_row[0], msg_row[1]) or ""
+                                if ':\n' in mc:
+                                    sender_wxid = mc.split(':\n', 1)[0]
+                                    speaker = names.get(sender_wxid, sender_wxid)
+                            elif my_sender_id is not None and msg_row[2] == my_sender_id:
+                                speaker = "我"
+                    except Exception:
+                        pass
+                    finally:
+                        msg_conn.close()
+
+                try:
+                    text = _silk_to_text(vdata)
+                    results.append(f"[{ts}] {speaker}: {text}" if text else f"[{ts}] {speaker}: (无法识别)")
+                except Exception as e:
+                    results.append(f"[{ts}] {speaker}: (转写失败: {e})")
+
+            return f"{display_name} 最近 {len(results)} 条语音转写:\n\n" + "\n".join(results)
+
+        else:
+            return "请指定 local_id（单条转写）或 limit（批量转写）"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_group_stats(chat_name: str, days: int = 1, limit: int = 500, date: str = "") -> str:
+    """统计群聊发言排行和活跃度。
+
+    Args:
+        chat_name: 群聊名称
+        days: 统计最近N天（默认1=今天）
+        limit: 最多扫描的消息数（默认500）
+        date: 指定具体日期，格式 YYYY-MM-DD（如 2026-03-05）
+    """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+    if '@chatroom' not in username:
+        return "此工具仅支持群聊"
+
+    names = get_contact_names()
+    display_name = names.get(username, username)
+
+    from datetime import timedelta
+    since_ts = 0
+    until_ts = 0
+    time_label = f"最近 {days} 天"
+    if date:
+        try:
+            day_start = datetime.strptime(date, "%Y-%m-%d")
+            since_ts = int(day_start.timestamp())
+            until_ts = int((day_start + timedelta(days=1)).timestamp())
+            time_label = date
+        except ValueError:
+            return "date 格式无效，请用 YYYY-MM-DD"
+    else:
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        since_ts = int((today_start - timedelta(days=days - 1)).timestamp())
+
+    messages, error = _load_chat_messages(username, display_name, limit, since_ts=since_ts, until_ts=until_ts)
+    if error:
+        return error
+    if not messages:
+        return f"{display_name} {time_label}无消息"
+
+    from collections import Counter
+    speaker_counter = Counter()
+    for msg in messages:
+        if msg['speaker_kind'] != 'system':
+            speaker_counter[msg['speaker_label']] += 1
+
+    total = len(messages)
+    lines = [f"{display_name} {time_label}发言统计 (共 {total} 条):\n"]
+    for rank, (name, count) in enumerate(speaker_counter.most_common(20), 1):
+        pct = count / total * 100
+        lines.append(f"{rank}. {name}: {count}条 ({pct:.0f}%)")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
